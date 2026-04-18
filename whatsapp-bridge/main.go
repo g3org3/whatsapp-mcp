@@ -10,6 +10,7 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -34,12 +35,13 @@ import (
 
 // Message represents a chat message for our client
 type Message struct {
-	Time      time.Time
-	Sender    string
-	Content   string
-	IsFromMe  bool
-	MediaType string
-	Filename  string
+	ID        string    `json:"id"`
+	Time      time.Time `json:"timestamp"`
+	Sender    string    `json:"sender"`
+	Content   string    `json:"content,omitempty"`
+	IsFromMe  bool      `json:"is_from_me"`
+	MediaType string    `json:"media_type,omitempty"`
+	Filename  string    `json:"filename,omitempty"`
 }
 
 // Database handler for storing message history
@@ -134,7 +136,7 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 // Get messages from a chat
 func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, error) {
 	rows, err := store.db.Query(
-		"SELECT sender, content, timestamp, is_from_me, media_type, filename FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?",
+		"SELECT id, sender, content, timestamp, is_from_me, media_type, filename FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?",
 		chatJID, limit,
 	)
 	if err != nil {
@@ -146,12 +148,15 @@ func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, er
 	for rows.Next() {
 		var msg Message
 		var timestamp time.Time
-		err := rows.Scan(&msg.Sender, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename)
-		if err != nil {
+		if err := rows.Scan(&msg.ID, &msg.Sender, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename); err != nil {
 			return nil, err
 		}
-		msg.Time = timestamp
+		msg.Time = timestamp.UTC()
 		messages = append(messages, msg)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
 	return messages, nil
@@ -199,8 +204,10 @@ func extractTextContent(msg *waProto.Message) string {
 }
 
 const (
-	defaultChatsLimit = 10
-	maxChatsLimit     = 100
+	defaultChatsLimit    = 10
+	maxChatsLimit        = 100
+	defaultMessagesLimit = 50
+	maxMessagesLimit     = 200
 )
 
 type ChatSummary struct {
@@ -213,6 +220,12 @@ type GetChatsResponse struct {
 	Success bool          `json:"success"`
 	Message string        `json:"message"`
 	Chats   []ChatSummary `json:"chats,omitempty"`
+}
+
+type FetchMessagesResponse struct {
+	Success  bool      `json:"success"`
+	Message  string    `json:"message"`
+	Messages []Message `json:"messages,omitempty"`
 }
 
 // SendMessageResponse represents the response for the send message API
@@ -889,6 +902,80 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Message:  fmt.Sprintf("Successfully downloaded %s media", mediaType),
 			Filename: filename,
 			Path:     path,
+		})
+	})
+
+	http.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/messages") {
+			http.NotFound(w, r)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(FetchMessagesResponse{
+				Success: false,
+				Message: "method not allowed",
+			})
+			return
+		}
+
+		path := strings.TrimPrefix(r.URL.Path, "/api/")
+		segments := strings.Split(path, "/")
+		if len(segments) != 2 || segments[0] == "" || segments[1] != "messages" {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(FetchMessagesResponse{
+				Success: false,
+				Message: "endpoint not found",
+			})
+			return
+		}
+
+		chatJID, err := url.PathUnescape(segments[0])
+		if err != nil || chatJID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(FetchMessagesResponse{
+				Success: false,
+				Message: "invalid chat JID",
+			})
+			return
+		}
+
+		limit := defaultMessagesLimit
+		if param := r.URL.Query().Get("limit"); param != "" {
+			parsed, err := strconv.Atoi(param)
+			if err != nil || parsed <= 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(FetchMessagesResponse{
+					Success: false,
+					Message: "limit must be a positive integer",
+				})
+				return
+			}
+			if parsed > maxMessagesLimit {
+				limit = maxMessagesLimit
+			} else {
+				limit = parsed
+			}
+		}
+
+		messages, err := messageStore.GetMessages(chatJID, limit)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(FetchMessagesResponse{
+				Success: false,
+				Message: fmt.Sprintf("failed to retrieve messages: %v", err),
+			})
+			return
+		}
+
+		json.NewEncoder(w).Encode(FetchMessagesResponse{
+			Success:  true,
+			Message:  fmt.Sprintf("returned %d message(s)", len(messages)),
+			Messages: messages,
 		})
 	})
 
