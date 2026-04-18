@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/binary"
@@ -13,14 +14,14 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
-
-	"bytes"
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
@@ -44,6 +45,12 @@ type Message struct {
 // Database handler for storing message history
 type MessageStore struct {
 	db *sql.DB
+}
+
+type chatRecord struct {
+	JID             string
+	Name            sql.NullString
+	LastMessageTime sql.NullTime
 }
 
 // Initialize message store
@@ -151,22 +158,24 @@ func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, er
 }
 
 // Get all chats
-func (store *MessageStore) GetChats() (map[string]time.Time, error) {
-	rows, err := store.db.Query("SELECT jid, last_message_time FROM chats ORDER BY last_message_time DESC")
+func (store *MessageStore) GetChats() ([]chatRecord, error) {
+	rows, err := store.db.Query("SELECT jid, name, last_message_time FROM chats ORDER BY last_message_time DESC, jid ASC")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	chats := make(map[string]time.Time)
+	var chats []chatRecord
 	for rows.Next() {
-		var jid string
-		var lastMessageTime time.Time
-		err := rows.Scan(&jid, &lastMessageTime)
-		if err != nil {
+		var rec chatRecord
+		if err := rows.Scan(&rec.JID, &rec.Name, &rec.LastMessageTime); err != nil {
 			return nil, err
 		}
-		chats[jid] = lastMessageTime
+		chats = append(chats, rec)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
 	return chats, nil
@@ -187,6 +196,23 @@ func extractTextContent(msg *waProto.Message) string {
 
 	// For now, we're ignoring non-text messages
 	return ""
+}
+
+const (
+	defaultChatsLimit = 10
+	maxChatsLimit     = 100
+)
+
+type ChatSummary struct {
+	JID             string `json:"jid"`
+	Name            string `json:"name,omitempty"`
+	LastMessageTime string `json:"last_message_time,omitempty"`
+}
+
+type GetChatsResponse struct {
+	Success bool          `json:"success"`
+	Message string        `json:"message"`
+	Chats   []ChatSummary `json:"chats,omitempty"`
 }
 
 // SendMessageResponse represents the response for the send message API
@@ -677,6 +703,98 @@ func extractDirectPathFromURL(url string) string {
 
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	http.HandleFunc("/api/chats", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Allow", http.MethodGet)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(GetChatsResponse{
+				Success: false,
+				Message: "method not allowed",
+			})
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		limit := defaultChatsLimit
+		if param := r.URL.Query().Get("limit"); param != "" {
+			parsed, err := strconv.Atoi(param)
+			if err != nil || parsed <= 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(GetChatsResponse{
+					Success: false,
+					Message: "limit must be a positive integer",
+				})
+				return
+			}
+
+			if parsed > maxChatsLimit {
+				limit = maxChatsLimit
+			} else {
+				limit = parsed
+			}
+		}
+
+		records, err := messageStore.GetChats()
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(GetChatsResponse{
+				Success: false,
+				Message: fmt.Sprintf("failed to retrieve chats: %v", err),
+			})
+			return
+		}
+
+		sort.SliceStable(records, func(i, j int) bool {
+			recI := records[i]
+			recJ := records[j]
+
+			if recI.LastMessageTime.Valid && recJ.LastMessageTime.Valid {
+				if recI.LastMessageTime.Time.Equal(recJ.LastMessageTime.Time) {
+					return recI.JID < recJ.JID
+				}
+				return recI.LastMessageTime.Time.After(recJ.LastMessageTime.Time)
+			}
+
+			if recI.LastMessageTime.Valid {
+				return true
+			}
+			if recJ.LastMessageTime.Valid {
+				return false
+			}
+
+			return recI.JID < recJ.JID
+		})
+
+		summaries := make([]ChatSummary, 0, min(limit, len(records)))
+		count := 0
+		for _, rec := range records {
+			if count >= limit {
+				break
+			}
+
+			summary := ChatSummary{
+				JID: rec.JID,
+			}
+			if rec.Name.Valid {
+				summary.Name = rec.Name.String
+			}
+			if rec.LastMessageTime.Valid {
+				summary.LastMessageTime = rec.LastMessageTime.Time.UTC().Format(time.RFC3339)
+			}
+
+			summaries = append(summaries, summary)
+			count++
+		}
+
+		json.NewEncoder(w).Encode(GetChatsResponse{
+			Success: true,
+			Message: fmt.Sprintf("returned %d chat(s)", len(summaries)),
+			Chats:   summaries,
+		})
+	})
+
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
